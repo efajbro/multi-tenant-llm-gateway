@@ -7,6 +7,9 @@
 [![Hardware Constraints: RTX 4060 | 16GB](https://img.shields.io/badge/Hardware-RTX_4060_%7C_16GB-76B900?logo=nvidia)](#)
 
 </div>
+
+---
+
 ## Abstract
 Commodity hardware presents a hostile environment for concurrent Large Language Model (LLM) inference due to severe VRAM and system memory bottlenecks. This repository proposes and implements a highly available, multi-tenant AI inference topology designed to operate strictly within the boundaries of an 8GB VRAM (NVIDIA RTX 4060) and 10GB System RAM environment. By decoupling request ingress from GPU execution via a custom Golang Token-Bucket API Gateway and Kubernetes (Kueue) batch scheduling, the system achieves zero Out-Of-Memory (OOM) evictions under high-concurrency traffic spikes.
 
