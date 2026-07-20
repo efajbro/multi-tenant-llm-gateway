@@ -1,25 +1,30 @@
+---
 apiVersion: v1
 kind: ServiceAccount
 metadata:
   name: gateway-sa
+  namespace: default
 ---
 apiVersion: rbac.authorization.k8s.io/v1
 kind: ClusterRole
 metadata:
   name: gateway-role
 rules:
-- apiGroups: ["batch"]
-  resources: ["jobs"]
-  verbs: ["create", "get", "list", "watch"]
+  - apiGroups: [batch]
+    resources: [jobs]
+    verbs: [create, get, list, watch]
+  - apiGroups: [""]
+    resources: [pods, pods/log]
+    verbs: [get, list, watch]
 ---
 apiVersion: rbac.authorization.k8s.io/v1
 kind: ClusterRoleBinding
 metadata:
   name: gateway-binding
 subjects:
-- kind: ServiceAccount
-  name: gateway-sa
-  namespace: default
+  - kind: ServiceAccount
+    name: gateway-sa
+    namespace: default
 roleRef:
   kind: ClusterRole
   name: gateway-role
@@ -29,55 +34,210 @@ apiVersion: apps/v1
 kind: Deployment
 metadata:
   name: ai-gateway
+  namespace: default
+  labels:
+    app: gateway
 spec:
-  replicas: 1
+  replicas: 2
   selector:
     matchLabels:
       app: gateway
+  strategy:
+    type: RollingUpdate
+    rollingUpdate:
+      maxSurge: 1
+      maxUnavailable: 0  # Zero-downtime rolling update
   template:
     metadata:
       labels:
         app: gateway
+      annotations:
+        prometheus.io/scrape: "true"
+        prometheus.io/port: "8080"
+        prometheus.io/path: /metrics
     spec:
       serviceAccountName: gateway-sa
+      securityContext:
+        runAsNonRoot: true
+        runAsUser: 1000
+        fsGroup: 1000
+      # Spread across zones to avoid single-AZ failure wiping both replicas
+      topologySpreadConstraints:
+        - maxSkew: 1
+          topologyKey: topology.kubernetes.io/zone
+          whenUnsatisfiable: DoNotSchedule
+          labelSelector:
+            matchLabels:
+              app: gateway
       containers:
-      - name: gateway
-        image: ai-gateway:v1
-        imagePullPolicy: Never
-        ports:
-        - containerPort: 8080
+        - name: gateway
+          image: ai-gateway:v2
+          imagePullPolicy: IfNotPresent  # Not 'Never' — works in any real cluster
+          ports:
+            - containerPort: 8080
+          securityContext:
+            allowPrivilegeEscalation: false
+            readOnlyRootFilesystem: true
+            capabilities:
+              drop: [ALL]
+          env:
+            - name: LOG_MODE
+              value: production
+            - name: REDIS_ADDR
+              value: redis.default.svc.cluster.local:6379
+            - name: GLOBAL_RPS
+              value: "200"
+            - name: K8S_WORKERS
+              value: "20"
+            - name: OLLAMA_BASE_URL
+              value: http://ollama-service:11434
+            - name: DEFAULT_NAMESPACE
+              value: default
+            # Load JWT public key from a Secret (not a ConfigMap — it's a key)
+            - name: JWT_PUBLIC_KEY_PEM
+              valueFrom:
+                secretKeyRef:
+                  name: gateway-jwt-public-key
+                  key: public.pem
+                  optional: true  # Falls back to DEV_MODE if missing
+            - name: DEV_MODE
+              value: "false"  # Set to "true" for local dev only
+          resources:
+            requests:
+              cpu: 250m
+              memory: 128Mi
+            limits:
+              cpu: 1000m
+              memory: 512Mi
+          # Liveness: process is running (always 200)
+          livenessProbe:
+            httpGet:
+              path: /healthz
+              port: 8080
+            initialDelaySeconds: 5
+            periodSeconds: 15
+            failureThreshold: 3
+          # Readiness: Redis is reachable + K8s client is healthy
+          readinessProbe:
+            httpGet:
+              path: /readyz
+              port: 8080
+            initialDelaySeconds: 5
+            periodSeconds: 10
+            failureThreshold: 2
+          # Startup: give 30s for first connection before liveness kicks in
+          startupProbe:
+            httpGet:
+              path: /healthz
+              port: 8080
+            failureThreshold: 6
+            periodSeconds: 5
+      terminationGracePeriodSeconds: 30  # Allow in-flight requests to drain
 ---
 apiVersion: v1
 kind: Service
 metadata:
   name: gateway-service
+  namespace: default
 spec:
   type: ClusterIP
   selector:
     app: gateway
   ports:
-  - port: 8080
-    targetPort: 8080
+    - port: 8080
+      targetPort: 8080
+---
+# PodDisruptionBudget: ensures at least one gateway pod stays up during
+# node drains and voluntary disruptions (rolling updates, kubectl drain).
+apiVersion: policy/v1
+kind: PodDisruptionBudget
+metadata:
+  name: gateway-pdb
+  namespace: default
+spec:
+  minAvailable: 1
+  selector:
+    matchLabels:
+      app: gateway
+---
+# HorizontalPodAutoscaler: scale out under CPU load.
+# In production, also add a custom metric on gateway_queue_depth.
+apiVersion: autoscaling/v2
+kind: HorizontalPodAutoscaler
+metadata:
+  name: gateway-hpa
+  namespace: default
+spec:
+  scaleTargetRef:
+    apiVersion: apps/v1
+    kind: Deployment
+    name: ai-gateway
+  minReplicas: 2
+  maxReplicas: 10
+  metrics:
+    - type: Resource
+      resource:
+        name: cpu
+        target:
+          type: Utilization
+          averageUtilization: 70
+---
+# Kueue: multi-tier queues with per-tier priority and preemption
+apiVersion: kueue.x-k8s.io/v1beta1
+kind: ResourceFlavor
+metadata:
+  name: gpu-t4-16gb
 ---
 apiVersion: kueue.x-k8s.io/v1beta1
 kind: ResourceFlavor
 metadata:
-  name: default-flavor
+  name: gpu-a100-40gb
 ---
+apiVersion: kueue.x-k8s.io/v1beta1
+kind: ResourceFlavor
+metadata:
+  name: gpu-cpu-only
+---
+# ClusterQueue: two GPU tiers with borrowing and preemption
 apiVersion: kueue.x-k8s.io/v1beta1
 kind: ClusterQueue
 metadata:
   name: cluster-queue
 spec:
   namespaceSelector: {}
+  preemption:
+    reclaimWithinCohort: LowerPriority
+    withinClusterQueue: LowerPriority
   resourceGroups:
-  - coveredResources: ["nvidia.com/gpu"]
-    flavors:
-    - name: "default-flavor"
-      resources:
-      - name: "nvidia.com/gpu"
-        nominalQuota: 1
+    - coveredResources: [nvidia.com/gpu, cpu, memory]
+      flavors:
+        - name: gpu-a100-40gb
+          resources:
+            - name: nvidia.com/gpu
+              nominalQuota: "4"
+              borrowingLimit: "2"
+        - name: gpu-t4-16gb
+          resources:
+            - name: nvidia.com/gpu
+              nominalQuota: "8"
+              borrowingLimit: "4"
+        - name: gpu-cpu-only
+          resources:
+            - name: cpu
+              nominalQuota: "32"
+            - name: memory
+              nominalQuota: 128Gi
 ---
+# Premium queue: high priority, can preempt standard jobs
+apiVersion: kueue.x-k8s.io/v1beta1
+kind: LocalQueue
+metadata:
+  name: premium-queue
+  namespace: default
+spec:
+  clusterQueue: cluster-queue
+---
+# Standard queue: normal priority
 apiVersion: kueue.x-k8s.io/v1beta1
 kind: LocalQueue
 metadata:
@@ -85,3 +245,20 @@ metadata:
   namespace: default
 spec:
   clusterQueue: cluster-queue
+---
+# PriorityClass for premium tenants — their Jobs get preemption rights
+apiVersion: scheduling.k8s.io/v1
+kind: PriorityClass
+metadata:
+  name: ai-gateway-premium
+value: 1000
+globalDefault: false
+description: "Premium AI Gateway tenant jobs. Can preempt standard jobs."
+---
+apiVersion: scheduling.k8s.io/v1
+kind: PriorityClass
+metadata:
+  name: ai-gateway-standard
+value: 500
+globalDefault: false
+description: "Standard AI Gateway tenant jobs."
